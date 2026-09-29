@@ -1,0 +1,7 @@
+config,cmd,dsa,dsa_min,iaa,iaa_min,depth,huffman,progress,cpu_async,codec,level,dictionary,rows,cols,page,batch,raw_bytes,file_bytes,ratio,secs_median,secs_min,gbps,dsa_descs,dsa_bytes,dsa_partial,iaa_jobs,iaa_fallbacks,verified
+sync-cpu,(stock),off,16384,off,0,8,dynamic,all,0,gzip,1,0,4194304,4,1048576,1024,134217728,41532284,3.232,0.84575,0.84342,0.1587,0,0,0,0,0,1
+async-cpu,--cpu-async 8,off,16384,off,0,8,dynamic,all,8,gzip,1,0,4194304,4,1048576,1024,134217728,41532284,3.232,0.12719,0.12653,1.0552,0,0,0,0,0,1
+sync-accel,--iaa sync --iaa-min 0,off,16384,sync,0,8,dynamic,all,0,gzip,1,0,4194304,4,1048576,1024,134217728,41066117,3.268,0.18459,0.18418,0.7271,0,0,0,848,0,1
+async-accel,--iaa async --iaa-min 0,off,16384,async,0,8,dynamic,all,0,gzip,1,0,4194304,4,1048576,1024,134217728,41066117,3.268,0.04963,0.04914,2.7044,0,0,0,848,0,1
+opt-sync-accel,--iaa sync --iaa-min 0,off,16384,sync,0,8,dynamic,all,0,gzip,1,0,4194304,4,1048576,1024,134217728,41066117,3.268,0.18391,0.18326,0.7298,0,0,0,848,0,1
+opt-async-accel,--iaa async --iaa-min 0,off,16384,async,0,8,dynamic,all,0,gzip,1,0,4194304,4,1048576,1024,134217728,41066117,3.268,0.04899,0.04870,2.7398,0,0,0,848,0,1

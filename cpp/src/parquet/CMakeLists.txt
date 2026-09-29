@@ -236,6 +236,23 @@ endif()
 set(PARQUET_SHARED_LINK_LIBS)
 set(PARQUET_SHARED_PRIVATE_LINK_LIBS)
 
+# async-examples: DSA/IAA offload hooks for the page-construction path.
+set(PARQUET_ACCEL_COMMON_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common"
+    CACHE PATH "async-examples/common (dsa_async.h)")
+set(PARQUET_QPL_INCLUDE_DIR
+    "/mnt/nvme/joshk/AccelAgent/admission-heuristics/third_party/qpl/include"
+    CACHE PATH "Intel QPL include directory")
+set(PARQUET_QPL_LIBRARY
+    "${PARQUET_ACCEL_COMMON_DIR}/qpl-build/sources/libqpl.a"
+    CACHE FILEPATH "Intel QPL static library (built with -fPIC)")
+list(APPEND PARQUET_SRCS accel_offload.cc)
+set_source_files_properties(accel_offload.cc
+                            PROPERTIES INCLUDE_DIRECTORIES
+                                       "${PARQUET_ACCEL_COMMON_DIR};${PARQUET_QPL_INCLUDE_DIR}")
+list(APPEND PARQUET_SHARED_PRIVATE_LINK_LIBS ${PARQUET_QPL_LIBRARY} ${CMAKE_DL_LIBS})
+list(APPEND PARQUET_STATIC_LINK_LIBS ${PARQUET_QPL_LIBRARY} ${CMAKE_DL_LIBS})
+
 list(APPEND PARQUET_SHARED_LINK_LIBS ${ARROW_XSIMD})
 list(APPEND PARQUET_SHARED_PRIVATE_LINK_LIBS ${ARROW_XSIMD})
 list(APPEND PARQUET_STATIC_LINK_LIBS ${ARROW_XSIMD})

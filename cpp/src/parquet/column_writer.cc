@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <span>
@@ -49,6 +50,7 @@
 #include "arrow/util/unreachable.h"
 #include "arrow/visit_array_inline.h"
 #include "arrow/visit_data_inline.h"
+#include "parquet/accel_offload.h"
 #include "parquet/bloom_filter_writer.h"
 #include "parquet/chunker_internal.h"
 #include "parquet/column_page.h"
@@ -381,6 +383,22 @@ class SerializedPageWriter : public PageWriter {
     // Use Arrow::Buffer::shrink_to_fit = false
     // underlying buffer only keeps growing. Resize to a smaller size does not reallocate.
     PARQUET_THROW_NOT_OK(dest_buffer->Resize(max_compressed_size, false));
+
+    if (accel::GetConfig().iaa != accel::Mode::kOff &&
+        src_buffer.size() >= accel::GetConfig().iaa_min_bytes &&
+        compressor_->compression_type() == Compression::GZIP) {
+      const int64_t iaa_cap = accel::IaaMinCapacity(src_buffer.size());
+      if (iaa_cap > max_compressed_size) {
+        PARQUET_THROW_NOT_OK(dest_buffer->Resize(iaa_cap, false));
+      }
+      int64_t n = accel::IaaCompress(src_buffer.data(), src_buffer.size(),
+                                     dest_buffer->mutable_data(), iaa_cap);
+      if (n >= 0) {
+        PARQUET_THROW_NOT_OK(dest_buffer->Resize(n, false));
+        return;
+      }
+      accel::CountIaaFallback();
+    }
 
     PARQUET_ASSIGN_OR_THROW(
         int64_t compressed_size,
@@ -783,7 +801,13 @@ class ColumnWriterImpl {
     }
   }
 
-  virtual ~ColumnWriterImpl() = default;
+  virtual ~ColumnWriterImpl() {
+    // Never free buffers the accelerator may still be writing.
+    for (auto& p : pending_pages_) {
+      if (p.job) accel::IaaFinish(p.job);
+      if (p.cpu_job) accel::CpuFinish(p.cpu_job);
+    }
+  }
 
   int64_t Close();
 
@@ -930,8 +954,94 @@ class ColumnWriterImpl {
     memcpy(combined, definition_levels_rle_->data(),
            static_cast<size_t>(definition_levels_rle_size));
     combined += definition_levels_rle_size;
-    memcpy(combined, values->data(), static_cast<size_t>(values->size()));
+    accel::Copy(combined, values->data(), static_cast<size_t>(values->size()));
   }
+
+  // ---- async IAA page compression pipeline (async-examples experiment) ----
+  // A V1 data page whose compression is in flight on IAA. Pages complete and
+  // are written strictly in submission order.
+  struct PendingPage {
+    std::shared_ptr<ResizableBuffer> uncompressed;
+    std::shared_ptr<ResizableBuffer> compressed;
+    accel::IaaJob* job = nullptr;
+    accel::CpuJob* cpu_job = nullptr;  // async-cpu control (worker-thread gzip)
+    int32_t num_values = 0;
+    Encoding::type encoding = Encoding::PLAIN;
+    int64_t uncompressed_size = 0;
+    EncodedStatistics stats;
+    SizeStatistics size_stats;
+    int64_t first_row_index = 0;
+    bool buffered = false;  // dictionary mode: keep in data_pages_
+  };
+  std::deque<PendingPage> pending_pages_;
+  std::vector<std::shared_ptr<ResizableBuffer>> spare_page_buffers_;
+
+  // The page pipeline is shared by the IAA async path and the async-cpu
+  // control; only the compression backend differs.
+  bool UseAsyncPages() const {
+    const accel::Config& c = accel::GetConfig();
+    return (c.iaa == accel::Mode::kAsync || c.cpu_async_threads > 0) &&
+           pager_->has_compressor() &&
+           properties_->compression(descr_->path()) == Compression::GZIP;
+  }
+
+  std::shared_ptr<ResizableBuffer> TakePageBuffer() {
+    if (!spare_page_buffers_.empty()) {
+      auto b = std::move(spare_page_buffers_.back());
+      spare_page_buffers_.pop_back();
+      return b;
+    }
+    return std::static_pointer_cast<ResizableBuffer>(AllocateBuffer(allocator_, 0));
+  }
+
+  void FinishFrontPage() {
+    PendingPage p = std::move(pending_pages_.front());
+    pending_pages_.pop_front();
+    int64_t n = p.job          ? accel::IaaFinish(p.job)
+                : p.cpu_job    ? accel::CpuFinish(p.cpu_job)
+                               : -1;
+    if (n >= 0) {
+      PARQUET_THROW_NOT_OK(p.compressed->Resize(n, false));
+    } else {
+      if (p.job != nullptr) accel::CountIaaFallback();
+      pager_->Compress(*p.uncompressed, p.compressed.get());
+    }
+    spare_page_buffers_.push_back(std::move(p.uncompressed));
+    auto page = std::make_unique<DataPageV1>(
+        p.compressed, p.num_values, p.encoding, Encoding::RLE, Encoding::RLE,
+        p.uncompressed_size, std::move(p.stats), p.first_row_index,
+        std::move(p.size_stats));
+    if (p.buffered) {
+      total_compressed_bytes_ += page->size() + sizeof(format::PageHeader);
+      data_pages_.push_back(std::move(page));
+    } else {
+      WriteDataPage(*page);
+      spare_page_buffers_.push_back(std::move(p.compressed));
+    }
+  }
+
+  static bool PageReady(const PendingPage& p) {
+    if (p.job != nullptr) return accel::IaaDone(p.job);
+    if (p.cpu_job != nullptr) return accel::CpuDone(p.cpu_job);
+    return true;  // nothing in flight: compress on the spot
+  }
+
+  // Writes out completed pages; blocks only if more than `depth` in flight.
+  void ReapPendingPages(size_t max_in_flight) {
+    while (!pending_pages_.empty() &&
+           (pending_pages_.size() > max_in_flight || PageReady(pending_pages_.front()))) {
+      FinishFrontPage();
+    }
+  }
+
+  void DrainPendingPages() {
+    while (!pending_pages_.empty()) FinishFrontPage();
+  }
+
+  void BuildDataPageV1Async(int64_t definition_levels_rle_size,
+                            int64_t repetition_levels_rle_size,
+                            int64_t uncompressed_size,
+                            const std::shared_ptr<Buffer>& values);
 };
 
 // return the size of the encoded buffer
@@ -1006,6 +1116,11 @@ void ColumnWriterImpl::BuildDataPageV1(int64_t definition_levels_rle_size,
                                        int64_t repetition_levels_rle_size,
                                        int64_t uncompressed_size,
                                        const std::shared_ptr<Buffer>& values) {
+  if (UseAsyncPages()) {
+    BuildDataPageV1Async(definition_levels_rle_size, repetition_levels_rle_size,
+                         uncompressed_size, values);
+    return;
+  }
   // Use Arrow::Buffer::shrink_to_fit = false
   // underlying buffer only keeps growing. Resize to a smaller size does not reallocate.
   PARQUET_THROW_NOT_OK(uncompressed_data_->Resize(uncompressed_size, false));
@@ -1015,6 +1130,8 @@ void ColumnWriterImpl::BuildDataPageV1(int64_t definition_levels_rle_size,
   page_stats.ApplyStatSizeLimits(properties_->max_statistics_size(descr_->path()));
   page_stats.set_is_signed(SortOrder::SIGNED == descr_->sort_order());
   ResetPageStatistics();
+  // Async DSA concatenation overlapped the statistics work above.
+  accel::DrainCopies();
 
   std::shared_ptr<Buffer> compressed_data;
   if (pager_->has_compressor()) {
@@ -1048,6 +1165,51 @@ void ColumnWriterImpl::BuildDataPageV1(int64_t definition_levels_rle_size,
   }
 }
 
+void ColumnWriterImpl::BuildDataPageV1Async(int64_t definition_levels_rle_size,
+                                            int64_t repetition_levels_rle_size,
+                                            int64_t uncompressed_size,
+                                            const std::shared_ptr<Buffer>& values) {
+  PendingPage p;
+  p.uncompressed = TakePageBuffer();
+  PARQUET_THROW_NOT_OK(p.uncompressed->Resize(uncompressed_size, false));
+  ConcatenateBuffers(definition_levels_rle_size, repetition_levels_rle_size, values,
+                     p.uncompressed->mutable_data());
+  auto [page_stats, page_size_stats] = GetPageStatistics();
+  page_stats.ApplyStatSizeLimits(properties_->max_statistics_size(descr_->path()));
+  page_stats.set_is_signed(SortOrder::SIGNED == descr_->sort_order());
+  ResetPageStatistics();
+  accel::DrainCopies();
+
+  // Same bound as zlib's deflateBound for stored blocks, plus gzip framing.
+  const int64_t cap = accel::IaaMinCapacity(uncompressed_size);
+  p.compressed = TakePageBuffer();
+  PARQUET_THROW_NOT_OK(p.compressed->Resize(cap, false));
+  const accel::Config& cfg = accel::GetConfig();
+  if (cfg.iaa == accel::Mode::kAsync) {
+    // Below the admission threshold the page is left unsubmitted; FinishFrontPage
+    // then compresses it on the CPU.
+    if (uncompressed_size >= cfg.iaa_min_bytes) {
+      p.job = accel::IaaSubmit(p.uncompressed->data(), uncompressed_size,
+                               p.compressed->mutable_data(), cap);
+    }
+  } else {
+    p.cpu_job = accel::CpuSubmit(p.uncompressed->data(), uncompressed_size,
+                                 p.compressed->mutable_data(), cap);
+  }
+  p.num_values = static_cast<int32_t>(num_buffered_values_);
+  p.encoding = encoding_;
+  p.uncompressed_size = uncompressed_size;
+  p.stats = std::move(page_stats);
+  p.size_stats = std::move(page_size_stats);
+  p.first_row_index = rows_written_ - num_buffered_rows_;
+  p.buffered = has_dictionary_ && !fallback_;
+  pending_pages_.push_back(std::move(p));
+  ReapPendingPages(static_cast<size_t>(
+      cfg.iaa == accel::Mode::kAsync ? cfg.iaa_depth
+      : cfg.cpu_async_depth > 0      ? cfg.cpu_async_depth
+                                     : cfg.cpu_async_threads));
+}
+
 void ColumnWriterImpl::BuildDataPageV2(int64_t definition_levels_rle_size,
                                        int64_t repetition_levels_rle_size,
                                        int64_t uncompressed_size,
@@ -1071,6 +1233,7 @@ void ColumnWriterImpl::BuildDataPageV2(int64_t definition_levels_rle_size,
 
   ConcatenateBuffers(definition_levels_rle_size, repetition_levels_rle_size,
                      compressed_values, combined->mutable_data());
+  accel::DrainCopies();
 
   auto [page_stats, page_size_stats] = GetPageStatistics();
   page_stats.ApplyStatSizeLimits(properties_->max_statistics_size(descr_->path()));
@@ -1150,6 +1313,7 @@ void ColumnWriterImpl::FlushBufferedDataPages() {
   if (num_buffered_values_ > 0) {
     AddDataPage();
   }
+  DrainPendingPages();
   for (const auto& page_ptr : data_pages_) {
     WriteDataPage(*page_ptr);
   }
@@ -1886,6 +2050,8 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
     if (page_statistics_ != nullptr) {
       page_statistics_->Update(values, num_values, num_nulls);
     }
+    // Async DSA value copy overlapped the statistics update above.
+    accel::DrainCopies();
 
     UpdateUnencodedDataBytes();
 

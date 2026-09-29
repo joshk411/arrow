@@ -16,6 +16,7 @@
 // under the License.
 
 #include "parquet/encoding.h"
+#include "parquet/accel_offload.h"
 
 #include <algorithm>
 #include <bit>
@@ -136,6 +137,7 @@ class PlainEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
   int64_t EstimatedDataEncodedSize() override { return sink_.length(); }
 
   std::shared_ptr<Buffer> FlushValues() override {
+    accel::DrainCopies();
     std::shared_ptr<Buffer> buffer;
     PARQUET_THROW_NOT_OK(sink_.Finish(&buffer));
     return buffer;
@@ -156,6 +158,7 @@ class PlainEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
       int num_valid_values = ::arrow::util::internal::SpacedCompress<T>(
           src, num_values, valid_bits, valid_bits_offset, data);
       Put(data, num_valid_values);
+      accel::DrainCopies();  // `buffer` is freed on return
     } else {
       Put(src, num_values);
     }
@@ -202,7 +205,19 @@ class PlainEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
 template <typename DType>
 void PlainEncoder<DType>::Put(const T* buffer, int num_values) {
   if (num_values > 0) {
-    PARQUET_THROW_NOT_OK(sink_.Append(buffer, num_values * sizeof(T)));
+    const int64_t nbytes = static_cast<int64_t>(num_values) * sizeof(T);
+    const accel::Config& ac = accel::GetConfig();
+    if (ac.dsa != accel::Mode::kOff && nbytes >= ac.dsa_min_bytes) {
+      if (sink_.length() + nbytes > sink_.capacity()) {
+        accel::DrainCopies();  // Reserve may reallocate the destination
+        PARQUET_THROW_NOT_OK(sink_.Reserve(nbytes));
+      }
+      accel::Copy(sink_.mutable_data() + sink_.length(), buffer,
+                  static_cast<size_t>(nbytes));
+      sink_.UnsafeAdvance(nbytes);
+      return;
+    }
+    PARQUET_THROW_NOT_OK(sink_.Append(buffer, nbytes));
   }
 }
 
@@ -357,6 +372,7 @@ class PlainEncoder<BooleanType> : public EncoderImpl, virtual public BooleanEnco
       int num_valid_values = ::arrow::util::internal::SpacedCompress<T>(
           src, num_values, valid_bits, valid_bits_offset, data);
       Put(data, num_valid_values);
+      accel::DrainCopies();  // `buffer` is freed on return
     } else {
       Put(src, num_values);
     }
@@ -895,6 +911,7 @@ class ByteStreamSplitEncoderBase : public EncoderImpl,
       int num_valid_values = ::arrow::util::internal::SpacedCompress<T>(
           src, num_values, valid_bits, valid_bits_offset, data);
       Put(data, num_valid_values);
+      accel::DrainCopies();  // `buffer` is freed on return
     } else {
       Put(src, num_values);
     }
@@ -1478,6 +1495,7 @@ class DeltaByteArrayEncoder : public EncoderImpl, virtual public TypedEncoder<DT
       int num_valid_values = ::arrow::util::internal::SpacedCompress<T>(
           src, num_values, valid_bits, valid_bits_offset, data);
       Put(data, num_valid_values);
+      accel::DrainCopies();  // `buffer` is freed on return
     } else {
       Put(src, num_values);
     }
@@ -1697,6 +1715,7 @@ class RleBooleanEncoder final : public EncoderImpl, virtual public BooleanEncode
       int num_valid_values = ::arrow::util::internal::SpacedCompress<T>(
           src, num_values, valid_bits, valid_bits_offset, data);
       Put(data, num_valid_values);
+      accel::DrainCopies();  // `buffer` is freed on return
     } else {
       Put(src, num_values);
     }

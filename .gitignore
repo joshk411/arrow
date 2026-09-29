@@ -94,3 +94,8 @@ rat.txt
 
 # for ODBC DLL
 *.rc
+
+# accel experiments
+cpp/build-rel/
+cpp/accel_bench/pq_accel_bench
+cpp/accel_bench/__pycache__/
