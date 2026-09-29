@@ -240,8 +240,9 @@ set(PARQUET_SHARED_PRIVATE_LINK_LIBS)
 set(PARQUET_ACCEL_COMMON_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common"
     CACHE PATH "async-examples/common (dsa_async.h)")
+# QPL v1.6.0 source is fetched by AccelAgent/admission-heuristics/scripts/build_qpl.sh.
 set(PARQUET_QPL_INCLUDE_DIR
-    "/mnt/nvme/joshk/AccelAgent/admission-heuristics/third_party/qpl/include"
+    "${PARQUET_ACCEL_COMMON_DIR}/../../admission-heuristics/third_party/qpl/include"
     CACHE PATH "Intel QPL include directory")
 set(PARQUET_QPL_LIBRARY
     "${PARQUET_ACCEL_COMMON_DIR}/qpl-build/sources/libqpl.a"
